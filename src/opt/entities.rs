@@ -56,7 +56,9 @@ pub struct EntityOptions {
     /// bottom face of the prefab and stops a tree from standing on one point
     /// of a sloped cell.
     pub sink: i32,
-    /// If true, each entity gets a random rotation around the vertical axis.
+    /// If true, each entity gets its own angle around the vertical axis, and
+    /// therefore its OWN grid. If false, every copy shares one grid, which is
+    /// one entity in place of thousands.
     pub random_yaw: bool,
     /// The number that starts the random sequence. The same number always
     /// gives the same positions.
@@ -69,7 +71,9 @@ impl Default for EntityOptions {
             prefab: Vec::new(),
             density: 1.0,
             sink: 4,
-            random_yaw: true,
+            // Off by default: a turn of any size needs one grid for each copy,
+            // and thousands of grids play badly.
+            random_yaw: false,
             seed: 0,
         }
     }
@@ -283,7 +287,8 @@ pub fn place_entities(
     let offset_x = -(width as i32 * half);
     let offset_y = -(height as i32 * half);
 
-    let mut grids = Vec::new();
+    // Where each copy goes, before the shape of the output is decided.
+    let mut placements = Vec::new();
     for ty in 0..tiles_y {
         for tx in 0..tiles_x {
             let pixel = entity_map.at(tx, ty);
@@ -305,52 +310,105 @@ pub fn place_entities(
             // The cell is `half * 2` units wide and the terrain is centered on
             // the origin, so this is the same arithmetic that puts a cell of
             // the terrain in the world.
-            let world_x = fx * (half * 2) as f32 + offset_x as f32;
-            let world_y = fy * (half * 2) as f32 + offset_y as f32;
-            let world_z =
-                (tops[cell_y as usize * width as usize + cell_x as usize] - entities.sink) as f32;
-
-            let yaw = if entities.random_yaw {
-                unit(entities.seed, tx, ty, 3) * std::f32::consts::TAU
-            } else {
-                0.0
-            };
-            grids.push((
-                Entity {
-                    asset: DYNAMIC_GRID,
-                    location: Vector3f {
-                        x: world_x,
-                        y: world_y,
-                        z: world_z,
-                    },
-                    rotation: yaw_quat(yaw),
-                    // The grids must not fall or move: they are scenery, and a
-                    // tree that rolls down a hill when the map loads is not
-                    // scenery.
-                    frozen: true,
-                    sleeping: true,
-                    data: dynamic_grid_entity(),
-                    ..Default::default()
-                },
-                entities.prefab.clone(),
-            ));
+            placements.push(Vector3f {
+                x: fx * (half * 2) as f32 + offset_x as f32,
+                y: fy * (half * 2) as f32 + offset_y as f32,
+                z: (tops[cell_y as usize * width as usize + cell_x as usize] - entities.sink)
+                    as f32,
+            });
         }
     }
 
+    let grids = if entities.random_yaw {
+        // A brick can turn by a quarter turn only, so an angle of any size has
+        // to be the rotation of a GRID. Each copy therefore needs its own.
+        //
+        // The cost is one entity for each copy. The game holds each grid
+        // separately, so a large wood becomes thousands of them and the frame
+        // rate falls. `--entity-no-yaw` is the default for that reason.
+        if placements.len() >= YAW_GRID_WARNING {
+            warn!(
+                "each of the {} entities with a random turn is a SEPARATE grid, because a \
+                 brick can only turn by a quarter turn. The game holds each grid on its own, \
+                 so this many will play badly. Remove --entity-yaw to put them all in one \
+                 grid, or lower --entity-density",
+                placements.len()
+            );
+        }
+        placements
+            .iter()
+            .enumerate()
+            .map(|(i, at)| {
+                (
+                    grid_entity(*at, unit(entities.seed, i as u32, 0, 3) * std::f32::consts::TAU),
+                    entities.prefab.clone(),
+                )
+            })
+            .collect()
+    } else if placements.is_empty() {
+        Vec::new()
+    } else {
+        // With no turn, a copy differs from the prefab by a MOVE alone, and a
+        // move is what a brick position already expresses. Every copy can
+        // therefore share one grid, which is one entity in place of thousands.
+        //
+        // The grid sits at the origin, so the position of a brick inside it is
+        // the same world position that a brick of the terrain would use. It is
+        // still a grid of its own, so its bricks may pass through the terrain.
+        let mut bricks = Vec::with_capacity(placements.len() * entities.prefab.len());
+        for at in &placements {
+            // Rounded to whole units, because a brick position is an integer.
+            // One unit is a tenth of a stud, so this moves nothing that anyone
+            // can see.
+            let offset = Position::new(
+                at.x.round() as i32,
+                at.y.round() as i32,
+                at.z.round() as i32,
+            );
+            bricks.extend(entities.prefab.iter().map(|brick| {
+                let mut brick = brick.clone();
+                brick.position += offset;
+                brick
+            }));
+        }
+        vec![(grid_entity(Vector3f::default(), 0.0), bricks)]
+    };
+
     info!(
-        "Placed {} entit(ies) of {} brick(s) each: {} brick(s) over {} separate grid(s)",
-        grids.len(),
+        "Placed {} entit(ies) of {} brick(s) each: {} brick(s) over {} grid(s)",
+        placements.len(),
         entities.prefab.len(),
-        grids.len() * entities.prefab.len(),
+        placements.len() * entities.prefab.len(),
         grids.len(),
     );
-    if grids.is_empty() {
+    if placements.is_empty() {
         warn!(
             "the entity map put no entities in the save: each of its pixels is black or fully \
              transparent, or --entity-density is 0"
         );
     }
     Ok(grids)
+}
+
+/// The number of turned entities above which the render says that the save
+/// will play badly.
+///
+/// Each one is a separate grid, and the game holds each grid on its own.
+const YAW_GRID_WARNING: usize = 256;
+
+/// One brick grid, at a world position and turned by `yaw` radians.
+fn grid_entity(location: Vector3f, yaw: f32) -> Entity {
+    Entity {
+        asset: DYNAMIC_GRID,
+        location,
+        rotation: yaw_quat(yaw),
+        // The grid must not fall or move: it is scenery, and a tree that rolls
+        // down a hill when the map loads is not scenery.
+        frozen: true,
+        sleeping: true,
+        data: dynamic_grid_entity(),
+        ..Default::default()
+    }
 }
 
 /// The probability that one pixel of the entity map gives.
@@ -434,6 +492,23 @@ mod tests {
 
     fn one_brick() -> Vec<Brick> {
         vec![Brick::default()]
+    }
+
+    /// The number of copies, whatever shape the result took: one grid holding
+    /// every copy, or one grid for each of them.
+    fn copies(grids: &[(Entity, Vec<Brick>)], prefab_len: usize) -> usize {
+        grids.iter().map(|(_, b)| b.len()).sum::<usize>() / prefab_len.max(1)
+    }
+
+    /// The position of each copy in the one shared grid. The tests use a
+    /// prefab of one brick, so a brick is a copy.
+    fn shared_positions(grids: &[(Entity, Vec<Brick>)]) -> Vec<(i32, i32)> {
+        assert_eq!(grids.len(), 1, "this reads the shape with one shared grid");
+        grids[0]
+            .1
+            .iter()
+            .map(|b| (b.position.x, b.position.y))
+            .collect()
     }
 
     fn entity_options() -> EntityOptions {
@@ -543,7 +618,7 @@ mod tests {
             &entity_options(),
         )
         .unwrap();
-        assert_eq!(white.len(), 64, "white must place one entity in each tile");
+        assert_eq!(copies(&white, 1), 64, "white must place one entity in each tile");
     }
 
     /// A transparent pixel places nothing, whatever its color. A user who
@@ -572,7 +647,7 @@ mod tests {
                 &entity_options(),
             )
             .unwrap();
-            assert_eq!(placed.len() as u32, tiles * tiles);
+            assert_eq!(copies(&placed, 1) as u32, tiles * tiles);
         }
     }
 
@@ -588,17 +663,15 @@ mod tests {
             &entity_options(),
         )
         .unwrap();
-        let edge = (cells * half) as f32;
-        for (entity, _) in &placed {
+        let edge = cells * half;
+        for (x, y) in shared_positions(&placed) {
             assert!(
-                entity.location.x >= -edge && entity.location.x <= edge,
-                "x {} is outside -{edge}..{edge}",
-                entity.location.x
+                x >= -edge && x <= edge,
+                "x {x} is outside -{edge}..{edge}"
             );
             assert!(
-                entity.location.y >= -edge && entity.location.y <= edge,
-                "y {} is outside -{edge}..{edge}",
-                entity.location.y
+                y >= -edge && y <= edge,
+                "y {y} is outside -{edge}..{edge}"
             );
         }
     }
@@ -609,22 +682,78 @@ mod tests {
     #[test]
     fn the_seed_decides_the_positions_and_repeats_them_exactly() {
         let place = |seed| {
-            place_entities(
-                &Flat(64, 64, 4),
-                &Solid(8, 8, [128, 128, 128, 255]),
-                &options(),
-                &EntityOptions {
-                    seed,
-                    ..entity_options()
-                },
+            shared_positions(
+                &place_entities(
+                    &Flat(64, 64, 4),
+                    &Solid(8, 8, [128, 128, 128, 255]),
+                    &options(),
+                    &EntityOptions {
+                        seed,
+                        ..entity_options()
+                    },
+                )
+                .unwrap(),
             )
-            .unwrap()
-            .iter()
-            .map(|(e, _)| (e.location.x, e.location.y))
-            .collect::<Vec<_>>()
         };
         assert_eq!(place(7), place(7), "one seed must repeat exactly");
         assert_ne!(place(7), place(8), "a different seed must move the entities");
+    }
+
+    /// With no turn, every copy shares ONE grid. A copy then differs from the
+    /// prefab by a move alone, which a brick position already expresses, so
+    /// thousands of separate grids would cost the game a great deal for
+    /// nothing. This is the default.
+    #[test]
+    fn without_a_turn_every_copy_shares_one_grid() {
+        let placed = place_entities(
+            &Flat(64, 64, 4),
+            &Solid(8, 8, [255, 255, 255, 255]),
+            &options(),
+            &entity_options(),
+        )
+        .unwrap();
+        assert!(
+            !EntityOptions::default().random_yaw,
+            "one shared grid must be the default"
+        );
+        assert_eq!(placed.len(), 1, "every copy must share one grid");
+        assert_eq!(placed[0].1.len(), 64, "the one grid must hold every copy");
+
+        // The copies must actually be at different places: one grid is of no
+        // use if each copy sits on top of the last.
+        let mut seen = shared_positions(&placed);
+        seen.sort_unstable();
+        seen.dedup();
+        assert!(seen.len() > 32, "the copies collapsed to {} places", seen.len());
+    }
+
+    /// A brick can turn by a quarter turn only, so an angle of any size has to
+    /// be the rotation of a GRID. Each copy then needs its own, and each gets
+    /// its own angle.
+    #[test]
+    fn a_random_turn_gives_each_copy_its_own_grid_and_its_own_angle() {
+        let placed = place_entities(
+            &Flat(64, 64, 4),
+            &Solid(8, 8, [255, 255, 255, 255]),
+            &options(),
+            &EntityOptions {
+                random_yaw: true,
+                ..entity_options()
+            },
+        )
+        .unwrap();
+        assert_eq!(placed.len(), 64, "each copy needs a grid of its own");
+        assert!(placed.iter().all(|(_, bricks)| bricks.len() == 1));
+
+        let mut angles: Vec<i32> = placed
+            .iter()
+            // The quaternion is a turn around the vertical axis only, so its z
+            // holds the angle.
+            .map(|(e, _)| (e.rotation.z * 1000.0) as i32)
+            .collect();
+        angles.sort_unstable();
+        angles.dedup();
+        assert!(angles.len() > 32, "the copies share {} angle(s)", angles.len());
     }
 
     /// A grey pixel is a probability, so it must place more entities than a
@@ -632,14 +761,14 @@ mod tests {
     #[test]
     fn a_grey_pixel_places_some_entities_but_not_all_of_them() {
         let count = |v: u8| {
-            place_entities(
+            let placed = place_entities(
                 &Flat(64, 64, 4),
                 &Solid(24, 24, [v, v, v, 255]),
                 &options(),
                 &entity_options(),
             )
-            .unwrap()
-            .len()
+            .unwrap();
+            copies(&placed, 1)
         };
         let (dark, grey, white) = (count(40), count(128), count(255));
         assert_eq!(white, 24 * 24);
@@ -654,7 +783,7 @@ mod tests {
     #[test]
     fn density_scales_the_number_of_entities() {
         let count = |density| {
-            place_entities(
+            let placed = place_entities(
                 &Flat(64, 64, 4),
                 &Solid(24, 24, [255, 255, 255, 255]),
                 &options(),
@@ -663,8 +792,8 @@ mod tests {
                     ..entity_options()
                 },
             )
-            .unwrap()
-            .len()
+            .unwrap();
+            copies(&placed, 1)
         };
         assert_eq!(count(1.0), 24 * 24);
         assert_eq!(count(0.0), 0);
@@ -691,15 +820,16 @@ mod tests {
                 },
             )
             .unwrap();
-            // A flat map has one height, so each entity must be at it.
+            // A flat map has one height, so each copy must be at it. The one
+            // shared grid sits at the origin, so the Z of a brick inside it is
+            // the world height.
             let expect =
-                (opts.base_height() - 5) as f32 + (shade as i32 * rise_unit(opts.scale)) as f32
-                    - 4.0;
-            for (entity, _) in &placed {
-                assert!(
-                    (entity.location.z - expect).abs() < 0.51,
-                    "an entity is at z {} but the surface is at {expect}",
-                    entity.location.z
+                opts.base_height() - 5 + shade as i32 * rise_unit(opts.scale) - 4;
+            for brick in &placed[0].1 {
+                assert_eq!(
+                    brick.position.z, expect,
+                    "a copy is at z {} but the surface is at {expect}",
+                    brick.position.z
                 );
             }
         }

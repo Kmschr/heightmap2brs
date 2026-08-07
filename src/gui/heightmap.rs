@@ -165,7 +165,7 @@ impl Default for HeightmapApp {
             entity_density: 1.0,
             entity_sink: 4,
             entity_seed: 0,
-            entity_yaw: true,
+            entity_yaw: false,
             promise: None,
             progress: ("Pending", 0.),
             progress_channel: mpsc::channel(),
@@ -757,6 +757,18 @@ impl HeightmapApp {
                                 "Give each copy its own angle, so a wood of one prefab does \
                                  not look like copies",
                             );
+                        if self.entity_yaw {
+                            // A brick turns by a quarter turn only, so an
+                            // angle of any size is the rotation of a GRID.
+                            // Each copy then needs its own, and the game holds
+                            // each grid on its own.
+                            ui.colored_label(
+                                Color32::from_rgb(255, 200, 100),
+                                "This gives each copy its own grid, which the game holds \
+                                 separately. It plays badly above a few hundred copies. With \
+                                 it off, every copy shares one grid.",
+                            );
+                        }
                     });
                 });
             });

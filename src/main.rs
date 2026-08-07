@@ -99,7 +99,7 @@ fn cli() -> clap::App<'static, 'static> {
         (@arg entitydensity: --("entity-density") +takes_value "Multiply the probability that each pixel of --entities gives (default 1.0). 0.5 gives about half as many entities; use it to thin a forest without painting the map again")
         (@arg entitysink: --("entity-sink") +takes_value "How far each entity goes DOWN into the ground, in units (default 4; 10 units = 1 brick). This hides the bottom face of the prefab and stops a tree from standing on one point of a sloped cell")
         (@arg entityseed: --("entity-seed") +takes_value "The number that starts the random placement (default 0). The same number always gives the same forest")
-        (@arg entitynoyaw: --("entity-no-yaw") "Do NOT turn each entity by a random angle. By default each one gets its own rotation around the vertical axis, so a forest of one prefab does not look like copies")
+        (@arg entityyaw: --("entity-yaw") "Give each entity its own random angle around the vertical axis, so a wood of one prefab does not look like copies. A brick can only turn by a quarter turn, so an angle of any size has to be the rotation of a GRID -- this makes each entity a SEPARATE grid, and the game holds each grid on its own. By default every entity shares ONE grid, which is one entity in place of thousands. Turn this on for a small number of entities; it plays badly for a large wood")
         (@arg prefab: --prefab "Heightmap/image renders: write a PREFAB bundle instead of a world, so the save can be dropped in Brickadia's Prefabs folder and spawned from the prefab browser rather than loaded as a level")
         (@arg snap: --snap "Snap bricks to the brick grid")
         (@arg lrgb: --lrgb "Use linear rgb input color instead of sRGB")
@@ -1633,7 +1633,7 @@ fn entity_grids(
             ("--entity-density", "entitydensity"),
             ("--entity-sink", "entitysink"),
             ("--entity-seed", "entityseed"),
-            ("--entity-no-yaw", "entitynoyaw"),
+            ("--entity-yaw", "entityyaw"),
         ] {
             if matches.is_present(name) {
                 warn!("{flag} applies to --entities renders only; there is no entity map to read");
@@ -1665,7 +1665,7 @@ fn entity_grids(
         prefab,
         density: parse_arg(matches, "entitydensity", "--entity-density", "a number", d.density)?,
         sink: parse_arg(matches, "entitysink", "--entity-sink", "an integer", d.sink)?,
-        random_yaw: !matches.is_present("entitynoyaw"),
+        random_yaw: matches.is_present("entityyaw"),
         seed: parse_arg(matches, "entityseed", "--entity-seed", "an integer", d.seed)?,
     };
 
