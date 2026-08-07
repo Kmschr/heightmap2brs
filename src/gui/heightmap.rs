@@ -624,14 +624,14 @@ impl HeightmapApp {
     fn draw_entities(&mut self, ui: &mut Ui) {
         bound_pane_width(ui);
         ui.label(
-            "Scatter copies of a prefab -- trees, rocks, anything you can save in the game -- \
-             over the finished ground.",
+            "Put copies of a prefab on the ground. A prefab can be a tree, a rock, or any \
+             other thing that you save in the game.",
         );
         ui.label(
-            "Each PIXEL of this image is one square of the map. Black leaves that square \
-             empty, white always puts one copy somewhere inside it, and a grey between them \
-             is the chance. The exact spot in the square is random, so a white area does not \
-             come out as a grid.",
+            "Each PIXEL of this image is one square of the map. A black pixel leaves its \
+             square empty. A white pixel always puts one copy in its square. A grey pixel \
+             gives the chance that a copy goes there. The position in the square is random, \
+             so a white area does not become a grid.",
         );
         ui.horizontal_wrapped(|ui| {
             if widgets::info(ui, format!("{}  Select entity map", icons::IMAGE)).clicked()
@@ -695,14 +695,14 @@ impl HeightmapApp {
             (true, false) => {
                 ui.colored_label(
                     Color32::from_rgb(255, 100, 100),
-                    "Now select a prefab. The image says WHERE a copy goes, and the .brz says \
-                     WHAT to put there.",
+                    "Now select a prefab. The image gives the position of each copy, and \
+                     the .brz file gives the thing to put there.",
                 );
             }
             (false, true) => {
                 ui.colored_label(
                     Color32::from_rgb(255, 200, 100),
-                    "Now select an entity map, or nothing is scattered.",
+                    "Now select an entity map. Without one, the tool puts no copies.",
                 );
             }
             _ => {}
@@ -711,7 +711,7 @@ impl HeightmapApp {
         if self.entity_map.is_some() && self.entity_prefab.is_some() {
             ui.add_space(4.0);
             widgets::settings_table(ui, |ui, t| {
-                t.row_hover(ui, "Amount", Some("Thin the scatter without painting the image again"), |ui| {
+                t.row_hover(ui, "Amount", Some("Decrease the number of copies with no change to the image"), |ui| {
                     widgets::slider(ui, egui::Slider::new(&mut self.entity_density, 0.0..=1.0));
                 });
                 t.row_hover(ui, "Sink", Some("How far each copy goes DOWN into the ground"), |ui| {
@@ -721,8 +721,8 @@ impl HeightmapApp {
                             egui::Slider::new(&mut self.entity_sink, 0..=40).text("units"),
                         );
                         ui.label(
-                            "10 units is one brick. This hides the bottom of the prefab and \
-                             stops a tree from standing on one corner of a slope.",
+                            "10 units is one brick. This hides the bottom face of the prefab. \
+                             It also stops a tree that stands on one corner of a slope.",
                         );
                     });
                 });
@@ -731,7 +731,7 @@ impl HeightmapApp {
                         widgets::slider(ui, egui::Slider::new(&mut self.entity_seed, 0..=999));
                         widgets::toggle(ui, &mut self.entity_yaw, "Turn each copy")
                             .on_hover_text(
-                                "Give each copy its own angle, so a wood of one prefab does \
+                                "Give each copy its own angle. A wood of one prefab then does \
                                  not look like copies",
                             );
                         if self.entity_yaw {
@@ -741,9 +741,9 @@ impl HeightmapApp {
                             // each grid on its own.
                             ui.colored_label(
                                 Color32::from_rgb(255, 200, 100),
-                                "This gives each copy its own grid, which the game holds \
-                                 separately. It plays badly above a few hundred copies. With \
-                                 it off, every copy shares one grid.",
+                                "This gives each copy its own grid, and the game holds each \
+                                 grid on its own. More than a few hundred copies will play \
+                                 badly. If you turn this off, all the copies share one grid.",
                             );
                         }
                     });
