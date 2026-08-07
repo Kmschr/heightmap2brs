@@ -141,6 +141,13 @@ test = true
 
 # A live gallery of the Brickadia egui theme (palette, semantic buttons, Font
 # Awesome icons). GUI-only, so it needs the same feature set as the GUI binary.
+# The Heightmap pane on its own, for looking at its layout without a click
+# through the homepage. GUI-only, like the theme sandbox below.
+[[example]]
+name = "heightmap_pane_shot"
+path = "examples/heightmap_pane_shot.rs"
+required-features = ["gui"]
+
 [[example]]
 name = "theme_sandbox"
 path = "examples/theme_sandbox.rs"

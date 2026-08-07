@@ -232,9 +232,11 @@ impl HeightmapApp {
     /// goes and the prefab says WHAT goes there. The Generate button refuses
     /// one without the other rather than making a save with no entities in it.
     fn entity_options(&self) -> Option<Result<EntityOptions, String>> {
-        let (map, prefab) = (self.entity_map.as_ref()?, self.entity_prefab.as_ref());
-        let _ = map;
-        let Some((name, bytes)) = prefab else {
+        // An entity map with no prefab is the error case; a prefab with no
+        // entity map scatters nothing and is reported by the card instead,
+        // because the user has given nothing that says WHERE.
+        self.entity_map.as_ref()?;
+        let Some((name, bytes)) = self.entity_prefab.as_ref() else {
             return Some(Err(
                 "an entity map needs an entity prefab: the image says where an entity goes, \
                  and the .brz says what goes there"
@@ -501,110 +503,6 @@ impl HeightmapApp {
                 });
             });
 
-            if !img_only {
-                t.row_hover(ui, "Entities", Some("Scatter a prefab over the terrain from a third image"), |ui| {
-                    ui.vertical(|ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            if widgets::info(ui, format!("{}  Entity map", icons::IMAGE)).clicked()
-                                && self.pending_pick.is_none()
-                            {
-                                self.pending_pick =
-                                    Some((PickTarget::EntityMap, pick_images(false)));
-                            }
-                            if widgets::info(ui, format!("{}  Prefab (.brz)", icons::IMAGE)).clicked()
-                                && self.pending_prefab.is_none()
-                            {
-                                self.pending_prefab = Some(pick_prefab_bytes());
-                            }
-                            if (self.entity_map.is_some() || self.entity_prefab.is_some())
-                                && widgets::danger_icon(ui, icons::XMARK).clicked()
-                            {
-                                self.entity_map = None;
-                                self.entity_prefab = None;
-                            }
-                        });
-                        let map = self.entity_map.as_ref().map(|i| i.name.as_str());
-                        let prefab = self.entity_prefab.as_ref().map(|(n, _)| n.as_str());
-                        match (map, prefab) {
-                            (None, None) => {
-                                ui.label(
-                                    "Each pixel of the entity map is one TILE. Black places \
-                                     nothing, white always places one entity somewhere in the \
-                                     tile, and a value between them is the probability. The \
-                                     size of the image gives the number of tiles.",
-                                );
-                            }
-                            (Some(map), Some(prefab)) => {
-                                let tiles = self
-                                    .entity_map
-                                    .as_ref()
-                                    .map(|i| (i.image.width(), i.image.height()))
-                                    .unwrap_or((0, 0));
-                                ui.label(format!(
-                                    "{map} ({}x{} tiles) scatters {prefab}",
-                                    tiles.0, tiles.1
-                                ));
-                            }
-                            // Each alone makes no save. Say which one is
-                            // missing rather than render nothing and stay
-                            // silent about the reason.
-                            (Some(map), None) => {
-                                ui.colored_label(
-                                    Color32::from_rgb(255, 100, 100),
-                                    format!("{map} needs a prefab: the image says WHERE an \
-                                             entity goes, and the .brz says WHAT goes there"),
-                                );
-                            }
-                            (None, Some(prefab)) => {
-                                ui.colored_label(
-                                    Color32::from_rgb(255, 200, 100),
-                                    format!("{prefab} needs an entity map, or nothing is \
-                                             scattered"),
-                                );
-                            }
-                        }
-                        if self.entity_map.is_some() {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("Density");
-                                widgets::slider(
-                                    ui,
-                                    egui::Slider::new(&mut self.entity_density, 0.0..=1.0),
-                                )
-                                .on_hover_text(
-                                    "Multiply the probability that each pixel gives. Use it to \
-                                     thin a forest without painting the map again",
-                                );
-                            });
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("Sink");
-                                widgets::slider(
-                                    ui,
-                                    egui::Slider::new(&mut self.entity_sink, 0..=40).text("units"),
-                                )
-                                .on_hover_text(
-                                    "How far each entity goes DOWN into the ground. This hides \
-                                     the bottom face of the prefab and stops a tree from \
-                                     standing on one point of a sloped cell",
-                                );
-                            });
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("Seed");
-                                widgets::slider(
-                                    ui,
-                                    egui::Slider::new(&mut self.entity_seed, 0..=999),
-                                )
-                                .on_hover_text("The same number always gives the same forest");
-                                widgets::toggle(ui, &mut self.entity_yaw, "Random turn")
-                                    .on_hover_text(
-                                        "Turn each entity by its own angle, so a forest of one \
-                                         prefab does not look like copies",
-                                    );
-                            });
-                        }
-                    });
-                });
-            }
-
             t.row_hover(ui, "Brick Type", Some("Change which brick type is used for the save file"), |ui| {
                 // `row_hover` gives the control a HORIZONTAL layout, so a note
                 // after the buttons becomes the next item in that flow and goes
@@ -654,7 +552,14 @@ impl HeightmapApp {
     /// The heightmap multi-select card body (heightmap mode only).
     fn draw_heightmaps(&mut self, ui: &mut Ui) {
         bound_pane_width(ui);
-        ui.label("Select image files to use for save generation.");
+        ui.label(
+            "The HEIGHT of the ground comes from how bright each pixel is. Black is the \
+             lowest ground and white is the highest.",
+        );
+        ui.label(
+            "Give more than one image to raise the number of steps: the tool adds them \
+             together. See the stacked_N.png files in example_maps.",
+        );
         if widgets::info(ui, format!("{}  Select heightmaps", icons::IMAGE)).clicked()
             && self.pending_pick.is_none()
         {
@@ -687,11 +592,21 @@ impl HeightmapApp {
     /// The colormap / single-image select card body.
     fn draw_colormap(&mut self, ui: &mut Ui, img_only: bool) {
         bound_pane_width(ui);
-        ui.label(if img_only {
-            "Select the image to convert into bricks (one brick per pixel, optimized)."
+        if img_only {
+            ui.label("Select the image to convert into bricks (one brick per pixel, optimized).");
         } else {
-            "Select image file to use for heightmap coloring."
-        });
+            ui.label(
+                "The COLOR of each brick comes from the pixel at the same position. Use an \
+                 image of the same size as the heightmap.",
+            );
+            // Said here rather than left for the user to find out: the render
+            // succeeds without a colormap, so a person who expects to need one
+            // has no way to learn that they do not.
+            ui.label(
+                "You can leave this empty. The tool then colors the ground with the \
+                 heightmap itself, which gives grey ground that gets lighter as it rises.",
+            );
+        }
         let pick_label = if img_only { "Select image" } else { "Select colormap" };
         if widgets::info(ui, format!("{}  {}", icons::IMAGE, pick_label)).clicked()
             && self.pending_pick.is_none()
@@ -714,6 +629,137 @@ impl HeightmapApp {
             if clear {
                 self.colormap = None;
             }
+        }
+    }
+
+    /// The entity scatter card: the third image, the prefab it places, and how.
+    ///
+    /// This is its own section beside the heightmap and the colormap, because
+    /// it takes an IMAGE in the same way that they do. As a row inside
+    /// Settings it read as a switch, and a person meeting it for the first
+    /// time had no reason to think it wanted a file at all.
+    fn draw_entities(&mut self, ui: &mut Ui) {
+        bound_pane_width(ui);
+        ui.label(
+            "Scatter copies of a prefab -- trees, rocks, anything you can save in the game -- \
+             over the finished ground.",
+        );
+        ui.label(
+            "Each PIXEL of this image is one square of the map. Black leaves that square \
+             empty, white always puts one copy somewhere inside it, and a grey between them \
+             is the chance. The exact spot in the square is random, so a white area does not \
+             come out as a grid.",
+        );
+        ui.label(
+            "Make this image SMALLER than the heightmap: its size gives the number of \
+             squares. A 96x96 image over a 384x384 heightmap puts at most one copy in each \
+             4x4 piece of ground.",
+        );
+
+        ui.horizontal_wrapped(|ui| {
+            if widgets::info(ui, format!("{}  Select entity map", icons::IMAGE)).clicked()
+                && self.pending_pick.is_none()
+            {
+                self.pending_pick = Some((PickTarget::EntityMap, pick_images(false)));
+            }
+            if widgets::info(ui, format!("{}  Select prefab (.brz)", icons::IMAGE)).clicked()
+                && self.pending_prefab.is_none()
+            {
+                self.pending_prefab = Some(pick_prefab_bytes());
+            }
+        });
+
+        if let Some(img) = &self.entity_map {
+            let mut clear = false;
+            egui::Grid::new("entity_map_grid")
+                .striped(true)
+                .spacing([8.0, 4.0])
+                .min_col_width(4.0)
+                .show(ui, |ui| {
+                    if widgets::danger_icon(ui, icons::XMARK).clicked() {
+                        clear = true;
+                    }
+                    thumb(ui, img);
+                    ui.add(
+                        egui::Label::new(format!(
+                            "{}  ({}x{} squares)",
+                            img.name,
+                            img.image.width(),
+                            img.image.height()
+                        ))
+                        .truncate(),
+                    );
+                });
+            if clear {
+                self.entity_map = None;
+            }
+        }
+        if let Some((name, _)) = &self.entity_prefab {
+            let mut clear = false;
+            egui::Grid::new("entity_prefab_grid")
+                .striped(true)
+                .spacing([8.0, 4.0])
+                .min_col_width(4.0)
+                .show(ui, |ui| {
+                    if widgets::danger_icon(ui, icons::XMARK).clicked() {
+                        clear = true;
+                    }
+                    ui.add(egui::Label::new(name.clone()).truncate());
+                });
+            if clear {
+                self.entity_prefab = None;
+            }
+        }
+
+        // Each of the two alone makes a save with nothing scattered in it. Say
+        // which one is missing, rather than render and stay silent about why
+        // there are no trees.
+        match (self.entity_map.is_some(), self.entity_prefab.is_some()) {
+            (true, false) => {
+                ui.colored_label(
+                    Color32::from_rgb(255, 100, 100),
+                    "Now select a prefab. The image says WHERE a copy goes, and the .brz says \
+                     WHAT to put there.",
+                );
+            }
+            (false, true) => {
+                ui.colored_label(
+                    Color32::from_rgb(255, 200, 100),
+                    "Now select an entity map, or nothing is scattered.",
+                );
+            }
+            _ => {}
+        }
+
+        if self.entity_map.is_some() && self.entity_prefab.is_some() {
+            ui.add_space(4.0);
+            widgets::settings_table(ui, |ui, t| {
+                t.row_hover(ui, "Amount", Some("Thin the scatter without painting the image again"), |ui| {
+                    widgets::slider(ui, egui::Slider::new(&mut self.entity_density, 0.0..=1.0));
+                });
+                t.row_hover(ui, "Sink", Some("How far each copy goes DOWN into the ground"), |ui| {
+                    ui.vertical(|ui| {
+                        widgets::slider(
+                            ui,
+                            egui::Slider::new(&mut self.entity_sink, 0..=40).text("units"),
+                        );
+                        ui.label(
+                            "10 units is one brick. This hides the bottom of the prefab and \
+                             stops a tree from standing on one corner of a slope.",
+                        );
+                    });
+                });
+                t.row_hover(ui, "Layout", Some("The same number always gives the same result"), |ui| {
+                    ui.vertical(|ui| {
+                        widgets::slider(ui, egui::Slider::new(&mut self.entity_seed, 0..=999));
+                        widgets::toggle(ui, &mut self.entity_yaw, "Turn each copy")
+                            .on_hover_text(
+                                "Give each copy its own angle, so a wood of one prefab does \
+                                 not look like copies",
+                            );
+                    });
+                });
+            });
         }
     }
 
@@ -829,7 +875,14 @@ impl HeightmapApp {
         } else {
             widgets::section(ui, "Heightmap Images", |ui| self.draw_heightmaps(ui));
             ui.add_space(10.0);
-            widgets::section(ui, "Colormap Image", |ui| self.draw_colormap(ui, false));
+            // Both of these render without a file, so their titles say so. A
+            // person meeting the tool for the first time otherwise reads three
+            // file pickers as three things they must supply.
+            widgets::section(ui, "Colormap Image (optional)", |ui| {
+                self.draw_colormap(ui, false)
+            });
+            ui.add_space(10.0);
+            widgets::section(ui, "Entity Map (optional)", |ui| self.draw_entities(ui));
         }
         ui.add_space(10.0);
         widgets::section(ui, "Settings", |ui| self.draw_settings(ui, shared, img_only));
@@ -898,6 +951,134 @@ mod tests {
         );
     }
 
+    /// Drive a real `egui::Context` over the pane and give back every piece of
+    /// text that it painted, with the box that the text occupies.
+    ///
+    /// egui needs no window for this, so these run in CI like any other test.
+    /// Four frames because a table learns its column widths from the frame
+    /// before it, which makes the first frame unrepresentative.
+    fn paint(
+        app: &mut HeightmapApp,
+        mut draw: impl FnMut(&mut HeightmapApp, &mut egui::Ui, &mut SharedOptions),
+    ) -> Vec<(egui::Rect, String)> {
+        let ctx = Context::default();
+        crate::gui::theme::install(&ctx);
+        let mut shared = SharedOptions::default();
+        let mut texts = Vec::new();
+        for _ in 0..4 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(900.0, 4000.0),
+                )),
+                ..Default::default()
+            };
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| draw(app, ui, &mut shared));
+            });
+            texts = out
+                .shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    egui::epaint::Shape::Text(t) => Some((
+                        egui::Rect::from_min_size(t.pos, t.galley.rect.size()),
+                        t.galley.text().to_string(),
+                    )),
+                    _ => None,
+                })
+                .collect();
+        }
+        texts
+    }
+
+    /// [`paint`] over the whole pane rather than one card.
+    fn paint_pane(app: &mut HeightmapApp, img_only: bool) -> Vec<(egui::Rect, String)> {
+        paint(app, |app, ui, shared| app.draw(ui, shared, img_only))
+    }
+
+    /// The two images that a render does not need must say so in their title.
+    ///
+    /// A person meeting the tool for the first time reads three file pickers
+    /// as three files that they must give. The colormap falls back to the
+    /// heightmap and the entity map scatters nothing, so both are optional,
+    /// and only the title can carry that before a file is picked.
+    #[test]
+    fn the_optional_images_are_named_optional_and_each_has_its_own_section() {
+        let painted = paint_pane(&mut HeightmapApp::default(), false);
+        let top = |want: &str| {
+            painted
+                .iter()
+                .find(|(_, s)| s == want)
+                .map(|(r, _)| r.top())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the pane painted no section {want:?}; it painted {:?}",
+                        painted.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>()
+                    )
+                })
+        };
+        // The entity map is a section of its own, after the colormap, and is
+        // not a row inside Settings.
+        assert!(
+            top("Heightmap Images") < top("Colormap Image (optional)")
+                && top("Colormap Image (optional)") < top("Entity Map (optional)"),
+            "the three image sections must come in order"
+        );
+        assert!(
+            top("Entity Map (optional)") < top("Settings"),
+            "the entity map must be its own section above Settings, not a row inside it"
+        );
+    }
+
+    /// The controls that shape the scatter must stay hidden until both files
+    /// are there, and the card must say which one is still missing.
+    ///
+    /// A first-time user meeting Amount, Sink and Layout with no prefab picked
+    /// has three controls that change nothing, and no statement of what to do
+    /// next.
+    #[test]
+    fn the_entity_controls_appear_only_once_both_files_are_picked() {
+        let image = |w, h| PickedImage {
+            name: "test.png".to_string(),
+            image: std::sync::Arc::new(image::RgbaImage::new(w, h)),
+        };
+        let shows = |app: &mut HeightmapApp, want: &str| {
+            paint_pane(app, false).iter().any(|(_, s)| s.contains(want))
+        };
+
+        let mut app = HeightmapApp::default();
+        assert!(!shows(&mut app, "Amount"), "no files: no controls");
+
+        app.entity_map = Some(image(8, 8));
+        assert!(!shows(&mut app, "Amount"), "a map with no prefab: no controls");
+        assert!(
+            shows(&mut app, "Now select a prefab"),
+            "a map with no prefab must ask for the prefab"
+        );
+
+        app.entity_prefab = Some(("pine.brz".to_string(), Vec::new()));
+        assert!(shows(&mut app, "Amount"), "both files: the controls appear");
+        assert!(shows(&mut app, "Sink") && shows(&mut app, "Layout"));
+
+        app.entity_map = None;
+        assert!(
+            shows(&mut app, "Now select an entity map"),
+            "a prefab with no map must ask for the map"
+        );
+    }
+
+    /// The Image2Brick page has no ground, so it must offer neither of them.
+    #[test]
+    fn the_image_page_offers_no_colormap_and_no_entity_map() {
+        let painted = paint_pane(&mut HeightmapApp::default(), true);
+        for title in ["Colormap Image (optional)", "Entity Map (optional)", "Heightmap Images"] {
+            assert!(
+                !painted.iter().any(|(_, s)| s == title),
+                "the image page must not show {title:?}: a flat image has no ground"
+            );
+        }
+    }
+
     /// The Brick Type and Optimization notes must sit BELOW their buttons, at
     /// the full width of the control column.
     ///
@@ -915,40 +1096,11 @@ mod tests {
         const NOTE: &str = "Note: this mode picks its own bricks per cell, so the Optimization \
                             and Snap settings above do not apply";
 
-        let ctx = Context::default();
-        crate::gui::theme::install(&ctx);
         let mut app = HeightmapApp::default();
         app.mode = BrickMode::Terrain;
-        let mut shared = SharedOptions::default();
-
-        let mut texts: Vec<(egui::Rect, String)> = Vec::new();
-        // Four frames to settle: a table learns its column widths from the
-        // frame before, so the first frame is not representative.
-        for _ in 0..4 {
-            let input = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::pos2(0.0, 0.0),
-                    egui::vec2(900.0, 2400.0),
-                )),
-                ..Default::default()
-            };
-            let out = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    app.draw_settings(ui, &mut shared, false);
-                });
-            });
-            texts = out
-                .shapes
-                .iter()
-                .filter_map(|c| match &c.shape {
-                    egui::epaint::Shape::Text(t) => Some((
-                        egui::Rect::from_min_size(t.pos, t.galley.rect.size()),
-                        t.galley.text().to_string(),
-                    )),
-                    _ => None,
-                })
-                .collect();
-        }
+        let texts = paint(&mut app, |app, ui, shared| {
+            app.draw_settings(ui, shared, false)
+        });
 
         let rect = |want: &str| {
             texts
