@@ -552,14 +552,7 @@ impl HeightmapApp {
     /// The heightmap multi-select card body (heightmap mode only).
     fn draw_heightmaps(&mut self, ui: &mut Ui) {
         bound_pane_width(ui);
-        ui.label(
-            "The HEIGHT of the ground comes from how bright each pixel is. Black is the \
-             lowest ground and white is the highest.",
-        );
-        ui.label(
-            "Give more than one image to raise the number of steps: the tool adds them \
-             together. See the stacked_N.png files in example_maps.",
-        );
+        ui.label("Select image files to use for save generation.");
         if widgets::info(ui, format!("{}  Select heightmaps", icons::IMAGE)).clicked()
             && self.pending_pick.is_none()
         {
@@ -592,21 +585,11 @@ impl HeightmapApp {
     /// The colormap / single-image select card body.
     fn draw_colormap(&mut self, ui: &mut Ui, img_only: bool) {
         bound_pane_width(ui);
-        if img_only {
-            ui.label("Select the image to convert into bricks (one brick per pixel, optimized).");
+        ui.label(if img_only {
+            "Select the image to convert into bricks (one brick per pixel, optimized)."
         } else {
-            ui.label(
-                "The COLOR of each brick comes from the pixel at the same position. Use an \
-                 image of the same size as the heightmap.",
-            );
-            // Said here rather than left for the user to find out: the render
-            // succeeds without a colormap, so a person who expects to need one
-            // has no way to learn that they do not.
-            ui.label(
-                "You can leave this empty. The tool then colors the ground with the \
-                 heightmap itself, which gives grey ground that gets lighter as it rises.",
-            );
-        }
+            "Select image file to use for heightmap coloring."
+        });
         let pick_label = if img_only { "Select image" } else { "Select colormap" };
         if widgets::info(ui, format!("{}  {}", icons::IMAGE, pick_label)).clicked()
             && self.pending_pick.is_none()
@@ -650,12 +633,6 @@ impl HeightmapApp {
              is the chance. The exact spot in the square is random, so a white area does not \
              come out as a grid.",
         );
-        ui.label(
-            "Make this image SMALLER than the heightmap: its size gives the number of \
-             squares. A 96x96 image over a 384x384 heightmap puts at most one copy in each \
-             4x4 piece of ground.",
-        );
-
         ui.horizontal_wrapped(|ui| {
             if widgets::info(ui, format!("{}  Select entity map", icons::IMAGE)).clicked()
                 && self.pending_pick.is_none()
