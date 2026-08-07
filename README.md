@@ -117,10 +117,18 @@ the surface and would appear to float over a sloped cell. A separate grid can
 be at any position and can pass through the main grid, so `--entity-sink`
 (default 4 units) simply pushes each prefab that far into the ground.
 
+By default **every copy shares one grid**. A copy differs from the prefab by a
+move alone, and a brick position already expresses a move, so the forest below
+is one entity rather than 3058 — which is what the game has to hold.
+
+`--entity-yaw` gives each copy its own angle instead. A brick can only turn by
+a quarter turn, so an angle of any size must be a *grid* rotation, and each
+copy then needs its own grid. Good for a handful of props; above a few hundred
+it plays badly, and the render says so.
+
 The rest: `--entity-density` multiplies every pixel's probability (thin a
-forest without repainting the map), `--entity-seed` picks the layout (the same
-number always gives the same forest), and `--entity-no-yaw` turns off the
-random rotation that stops a forest of one prefab looking like copies.
+forest without repainting the map) and `--entity-seed` picks the layout (the
+same number always gives the same forest).
 
 The GUI has the same controls in an **Entities** row.
 
