@@ -131,6 +131,19 @@ pub fn load_prefab(bytes: &[u8]) -> Result<Vec<Brick>, String> {
     let offset = Position::new((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, lo[2]);
     for brick in &mut bricks {
         brick.position -= offset;
+        // The owner belongs to the SAVE and not to the brick. A prefab made in
+        // the game names the people who built it -- `pine.brz` has a table of
+        // two, and its bricks point at the second -- but the save this tool
+        // writes has one owner. An index of 1 is then past the end of the
+        // table, and the game refuses the whole bundle with "Invalid original
+        // owner index 1 for brick 0" and gives no thumbnail. `None` lets the
+        // write path use the owner of the save that receives the bricks.
+        brick.owner_index = None;
+        brick.original_owner_index = None;
+        // The id links a brick to a wire or to a microchip. Each entity gets
+        // its own copy of these bricks, so an id from the prefab would appear
+        // thousands of times in one save.
+        brick.id = None;
     }
     info!(
         "Prefab: {} brick(s), {}x{}x{} units",
@@ -428,6 +441,86 @@ mod tests {
             prefab: one_brick(),
             ..Default::default()
         }
+    }
+
+    /// The owner belongs to the save, not to the brick.
+    ///
+    /// A prefab made in the game names the people who built it. `pine.brz`
+    /// carries a table of two owners and its bricks point at the second one.
+    /// The save that this tool writes has ONE owner, so an index of 1 is past
+    /// the end of its table: the game refuses the full bundle with "Invalid
+    /// original owner index 1 for brick 0" and shows no thumbnail. Nothing in
+    /// the types can hold this, and a save that the encoder accepts can still
+    /// fail in the game, so the test goes through a real `.brz`.
+    #[test]
+    fn a_prefab_forgets_the_owners_of_the_save_it_came_from() {
+        let mut world = brdb::World::new();
+        world.add_bricks(vec![
+            Brick {
+                position: Position::new(10, 20, 30),
+                owner_index: Some(0),
+                original_owner_index: Some(0),
+                id: Some(7),
+                ..Default::default()
+            },
+            Brick {
+                position: Position::new(-10, -20, 8),
+                owner_index: Some(0),
+                original_owner_index: Some(0),
+                ..Default::default()
+            },
+        ]);
+        let bytes = world.to_brz_vec().expect("the fixture must encode");
+
+        let bricks = load_prefab(&bytes).expect("the fixture must read back");
+        assert_eq!(bricks.len(), 2);
+        for brick in &bricks {
+            assert_eq!(
+                (brick.owner_index, brick.original_owner_index, brick.id),
+                (None, None, None),
+                "a brick of a prefab must point at no owner and no id of its own save"
+            );
+        }
+    }
+
+    /// The bricks must move to the origin, or each entity would go to the
+    /// position at which the prefab was saved. `pine.brz` was made at
+    /// `(678, 7691, 4)`.
+    #[test]
+    fn a_prefab_moves_to_the_origin_and_stands_on_zero() {
+        let mut world = brdb::World::new();
+        world.add_bricks(vec![
+            Brick {
+                position: Position::new(700, 7700, 100),
+                ..Default::default()
+            },
+            Brick {
+                position: Position::new(660, 7660, 20),
+                ..Default::default()
+            },
+        ]);
+        let bytes = world.to_brz_vec().unwrap();
+        let bricks = load_prefab(&bytes).unwrap();
+
+        // The two bricks are the same size, so the middle of the pair goes to
+        // x 0 and y 0 and the lower one stands at z 0.
+        let (mut lo, mut hi) = ([i32::MAX; 3], [i32::MIN; 3]);
+        for brick in &bricks {
+            let size = match &brick.asset {
+                BrickType::Procedural { size, .. } => {
+                    [size.x as i32, size.y as i32, size.z as i32]
+                }
+                _ => [0; 3],
+            };
+            let p = [brick.position.x, brick.position.y, brick.position.z];
+            for i in 0..3 {
+                lo[i] = lo[i].min(p[i] - size[i]);
+                hi[i] = hi[i].max(p[i] + size[i]);
+            }
+        }
+        assert_eq!(lo[0] + hi[0], 0, "the prefab must be centered on x 0");
+        assert_eq!(lo[1] + hi[1], 0, "the prefab must be centered on y 0");
+        assert_eq!(lo[2], 0, "the prefab must stand on z 0");
     }
 
     /// Black puts no entity and white puts one in each tile. This is the rule
