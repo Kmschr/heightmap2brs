@@ -94,6 +94,12 @@ fn cli() -> clap::App<'static, 'static> {
         (@arg stud: --stud "Render bricks as stud cubes")
         (@arg terrain: --terrain "Render the terrain as SMOOTH micro bricks instead of flat-topped tiles: every pixel gets a sloped top chosen from Brickadia's micro wedge family (ramp, wedge corner, inner corner, and the stacked diagonal corner+triangle), fitted to the four shared vertex heights around it. Heights are sampled on a shared (w+1)x(h+1) vertex grid so neighbouring cells MEET rather than step. Replaces --tile/--smooth/--micro/--stud and the optimizers, which have no meaning once the top face is not flat")
         (@arg rampify: --rampify "Rampify the terrain with Wrapperup's rampifier: fit full-size ramps, wedges and ramp corners onto the height column surface and fill the rest with plain bricks. Coarser than --terrain (one plate of vertical resolution, runs of at most 4 studs) but uses ordinary bricks rather than micro pieces. Replaces --tile/--smooth/--micro/--stud and the optimizers")
+        (@arg entities: --entities +takes_value "Scatter a prefab over the terrain, from a THIRD image: each of its pixels is one TILE of the map, black or fully transparent places nothing, white always places one entity, and a value between them is the probability. The position in the tile is random. The image has its own size, which selects the tile size -- a 64x64 entity map over a 512x512 heightmap gives one tile per 8x8 cells. Needs --entity-prefab")
+        (@arg entityprefab: --("entity-prefab") +takes_value "The .brz prefab that --entities scatters (make one in the game and save it). Each placement is a SEPARATE brick grid, so the prefab can go into the terrain rather than fight the main grid for space")
+        (@arg entitydensity: --("entity-density") +takes_value "Multiply the probability that each pixel of --entities gives (default 1.0). 0.5 gives about half as many entities; use it to thin a forest without painting the map again")
+        (@arg entitysink: --("entity-sink") +takes_value "How far each entity goes DOWN into the ground, in units (default 4; 10 units = 1 brick). This hides the bottom face of the prefab and stops a tree from standing on one point of a sloped cell")
+        (@arg entityseed: --("entity-seed") +takes_value "The number that starts the random placement (default 0). The same number always gives the same forest")
+        (@arg entitynoyaw: --("entity-no-yaw") "Do NOT turn each entity by a random angle. By default each one gets its own rotation around the vertical axis, so a forest of one prefab does not look like copies")
         (@arg prefab: --prefab "Heightmap/image renders: write a PREFAB bundle instead of a world, so the save can be dropped in Brickadia's Prefabs folder and spawned from the prefab browser rather than loaded as a level")
         (@arg snap: --snap "Snap bricks to the brick grid")
         (@arg lrgb: --lrgb "Use linear rgb input color instead of sRGB")
@@ -324,7 +330,7 @@ fn main() {
         .iter()
         .any(|m| matches.is_present(m))
     {
-        for flag in ["terrain", "rampify", "prefab"] {
+        for flag in ["terrain", "rampify", "prefab", "entities"] {
             if matches.is_present(flag) {
                 warn!(
                     "--{flag} applies to heightmap and --img renders only; this render is \
@@ -1554,6 +1560,16 @@ fn run_heightmap(
         fail!("Unsupported heightmap format");
     };
 
+    // BEFORE the terrain render, although the entities go into the save after
+    // it. The count of the entities and the file of the prefab are both known
+    // from the command line, so a prefab that cannot be read must not first
+    // cost a render of five seconds. `gen_opt_heightmap` also takes `options`
+    // by value, and the placer reads the same values to find the surface.
+    let entity_grids = match entity_grids(matches, &*heightmap, &options) {
+        Ok(g) => g,
+        Err(e) => fail!("{e}"),
+    };
+
     // Not `.expect(...)`: `gen_opt_heightmap` returns a `String` describing a
     // real user-facing condition (an image it cannot use), and a panic trace
     // reads as a crash rather than as the refusal it is.
@@ -1564,6 +1580,21 @@ fn run_heightmap(
 
     info!("Writing Save to {}", out_file);
     let mut data = bricks_to_save(bricks);
+    // Each entity is its OWN grid and is not a group of bricks on the main
+    // grid. Two bricks on one grid cannot occupy the same space, and an entity
+    // must go a little into the ground.
+    let has_entities = !entity_grids.is_empty();
+    for (entity, prefab) in entity_grids {
+        data.add_brick_grid(entity, prefab);
+    }
+    // A grid entity has a TYPE, and the save carries a table of the types that
+    // it uses. Without this the encoder refuses the save with
+    // "Entity_DynamicBrickGrid: unknown type". Called only when there are
+    // grids, so a render with no entities keeps the tables that each earlier
+    // version of this path wrote.
+    if has_entities {
+        data.register_used_components();
+    }
     // A prefab bundle and a world bundle differ in their metadata only. The
     // difference is `level_type` and the block of pivots and bounds that
     // `make_prefab` calculates from the brick positions. The code thus changes
@@ -1576,6 +1607,71 @@ fn run_heightmap(
     }
 
     info!("Done!");
+}
+
+/// Build the entity grids that `--entities` asks for, or an empty list when
+/// the flag is absent.
+///
+/// The two flags need each other: an entity map with no prefab has nothing to
+/// place, and a prefab with no entity map has nowhere to go. Each alone is
+/// refused by name rather than ignored, because a user who gave one of them
+/// wants entities and would see a save with none.
+#[cfg(not(target_arch = "wasm32"))]
+fn entity_grids(
+    matches: &clap::ArgMatches,
+    heightmap: &dyn Heightmap,
+    options: &GenOptions,
+) -> Result<Vec<(brdb::Entity, Vec<brdb::Brick>)>, String> {
+    let (Some(map_path), prefab_path) = (
+        matches.value_of("entities"),
+        matches.value_of("entityprefab"),
+    ) else {
+        // No entity map. Name the flags that then do nothing, in the same way
+        // as every other path in this file.
+        for (flag, name) in [
+            ("--entity-prefab", "entityprefab"),
+            ("--entity-density", "entitydensity"),
+            ("--entity-sink", "entitysink"),
+            ("--entity-seed", "entityseed"),
+            ("--entity-no-yaw", "entitynoyaw"),
+        ] {
+            if matches.is_present(name) {
+                warn!("{flag} applies to --entities renders only; there is no entity map to read");
+            }
+        }
+        return Ok(Vec::new());
+    };
+    let Some(prefab_path) = prefab_path else {
+        return Err(
+            "--entities needs --entity-prefab: the image says WHERE to put an entity, and the \
+             .brz prefab says WHAT to put there. Save a prefab in the game and pass it"
+                .to_string(),
+        );
+    };
+    if options.img {
+        return Err(
+            "--entities is not supported with --img: a flat image has no surface for an entity \
+             to stand on"
+                .to_string(),
+        );
+    }
+
+    let bytes = std::fs::read(prefab_path)
+        .map_err(|e| format!("could not read the prefab {prefab_path}: {e}"))?;
+    let prefab = load_prefab(&bytes)?;
+
+    let d = EntityOptions::default();
+    let entities = EntityOptions {
+        prefab,
+        density: parse_arg(matches, "entitydensity", "--entity-density", "a number", d.density)?,
+        sink: parse_arg(matches, "entitysink", "--entity-sink", "an integer", d.sink)?,
+        random_yaw: !matches.is_present("entitynoyaw"),
+        seed: parse_arg(matches, "entityseed", "--entity-seed", "an integer", d.seed)?,
+    };
+
+    let map = ColormapPNG::new(map_path, true)
+        .map_err(|e| format!("Error reading the entity map: {e}"))?;
+    place_entities(heightmap, &map, options, &entities)
 }
 
 /// Print the pre-render cost readout for whichever mode was chosen. The

@@ -5,9 +5,10 @@ use crate::{
         SharedOptions,
         util::{
             PickedImage, bound_pane_width, deliver_world, maps_from_images, out_file_warning_row,
-            pick_images, refuse_bad_out_file, save_destination_row, thumb,
+            pick_images, pick_prefab_bytes, refuse_bad_out_file, save_destination_row, thumb,
         },
     },
+    map::ColormapPNG,
     opt::*,
     util::{bricks_to_save, *},
 };
@@ -20,6 +21,10 @@ use log::{error, info};
 use poll_promise::Promise;
 
 type Progress = (&'static str, f32);
+
+/// The name and the raw bytes of a picked file, as the file dialog gives them.
+/// `None` if the user closed the dialog and picked nothing.
+type PickedFile = Option<(String, Vec<u8>)>;
 
 /// Why a render stopped early.
 ///
@@ -67,6 +72,8 @@ fn finish(result: Result<(), Halt>) -> Result<(), String> {
 enum PickTarget {
     Heightmaps,
     Colormap,
+    /// The third image: where an entity prefab goes. See `opt::entities`.
+    EntityMap,
 }
 
 /// What the Brick Type row selects. The first five values select the asset
@@ -118,6 +125,17 @@ pub struct HeightmapApp {
     opt_snap: bool,
     opt_glow: bool,
     mode: BrickMode,
+    /// The third image. Each of its pixels is one tile, and its value is the
+    /// probability that an entity goes somewhere in that tile.
+    entity_map: Option<PickedImage>,
+    /// The name and the bytes of the `.brz` that the entity map scatters.
+    /// Bytes and not a path, because the browser version has no file system.
+    entity_prefab: Option<(String, Vec<u8>)>,
+    pending_prefab: Option<Promise<PickedFile>>,
+    entity_density: f32,
+    entity_sink: i32,
+    entity_seed: u64,
+    entity_yaw: bool,
     progress: Progress,
     progress_channel: (Sender<Progress>, Receiver<Progress>),
     promise: Option<Promise<Result<(), String>>>,
@@ -141,6 +159,13 @@ impl Default for HeightmapApp {
             opt_glow: false,
             opt_hdmap: false,
             mode: BrickMode::Micro,
+            entity_map: None,
+            entity_prefab: None,
+            pending_prefab: None,
+            entity_density: 1.0,
+            entity_sink: 4,
+            entity_seed: 0,
+            entity_yaw: true,
             promise: None,
             progress: ("Pending", 0.),
             progress_channel: mpsc::channel(),
@@ -178,10 +203,53 @@ impl HeightmapApp {
                             self.colormap = Some(img);
                         }
                     }
+                    PickTarget::EntityMap => {
+                        if let Some(img) = images.into_iter().next() {
+                            info!("Selected entity map: {}", img.name);
+                            self.entity_map = Some(img);
+                        }
+                    }
                 },
                 Err(promise) => self.pending_pick = Some((target, promise)),
             }
         }
+        if let Some(promise) = self.pending_prefab.take() {
+            match promise.try_take() {
+                Ok(Some(picked)) => {
+                    info!("Selected entity prefab: {}", picked.0);
+                    self.entity_prefab = Some(picked);
+                }
+                // The user closed the dialog and picked nothing.
+                Ok(None) => {}
+                Err(promise) => self.pending_prefab = Some(promise),
+            }
+        }
+    }
+
+    /// The entity options, or `None` when this render scatters nothing.
+    ///
+    /// Both the map and the prefab are needed: the image says WHERE an entity
+    /// goes and the prefab says WHAT goes there. The Generate button refuses
+    /// one without the other rather than making a save with no entities in it.
+    fn entity_options(&self) -> Option<Result<EntityOptions, String>> {
+        let (map, prefab) = (self.entity_map.as_ref()?, self.entity_prefab.as_ref());
+        let _ = map;
+        let Some((name, bytes)) = prefab else {
+            return Some(Err(
+                "an entity map needs an entity prefab: the image says where an entity goes, \
+                 and the .brz says what goes there"
+                    .to_string(),
+            ));
+        };
+        Some(load_prefab(bytes).map_err(|e| format!("{name}: {e}")).map(|prefab| {
+            EntityOptions {
+                prefab,
+                density: self.entity_density,
+                sink: self.entity_sink,
+                random_yaw: self.entity_yaw,
+                seed: self.entity_seed,
+            }
+        }))
     }
 
     fn options(&self, img_only: bool) -> GenOptions {
@@ -240,6 +308,10 @@ impl HeightmapApp {
             self.heightmaps.clone()
         };
         let colormap = self.colormap.clone();
+        // The Image2Brick page scatters nothing: a flat image has no surface
+        // for an entity to stand on.
+        let entities = if img_only { None } else { self.entity_options() };
+        let entity_map = self.entity_map.clone();
 
         let progress_tx = self.progress_channel.0.clone();
         // Send failures are IGNORED, as in the Video and Audio panes: a closed
@@ -274,6 +346,25 @@ impl HeightmapApp {
                 stopped()?;
                 progress("Generating", 0.10);
 
+                // The entity grids are made BEFORE the terrain, although they
+                // go into the save after it. `gen_opt_heightmap` takes
+                // `options` by value, and the placer reads the same values to
+                // find the surface. A prefab that cannot be read then fails at
+                // once and does not first cost a full render.
+                let mut grids = Vec::new();
+                if let Some(entities) = entities {
+                    let entities = entities?;
+                    let map = ColormapPNG::from_image(
+                        // `lrgb` true keeps the values of the pixels: the
+                        // entity map is a mask and not a color, so it must not
+                        // go through a color conversion.
+                        (*entity_map.expect("an entity map made these options").image).clone(),
+                        true,
+                    );
+                    grids = place_entities(&*heightmap, &map, &options, &entities)?;
+                }
+                stopped()?;
+
                 let bricks = gen_opt_heightmap(&*heightmap, &*colormap, options, |p| {
                     progress("Generating", 0.1 + 0.85 * p);
                     !is_stopped()
@@ -282,7 +373,19 @@ impl HeightmapApp {
 
                 info!("Writing Save to {}", out_file);
                 progress("Writing", 0.95);
-                let data = bricks_to_save(bricks);
+                let mut data = bricks_to_save(bricks);
+                // Each entity is its OWN grid. Two bricks on one grid cannot
+                // occupy the same space, and an entity must go a little into
+                // the ground.
+                let has_entities = !grids.is_empty();
+                for (entity, prefab) in grids {
+                    data.add_brick_grid(entity, prefab);
+                }
+                // Without this the encoder refuses the save with
+                // "Entity_DynamicBrickGrid: unknown type".
+                if has_entities {
+                    data.register_used_components();
+                }
 
                 // This pane's own extension branch, now shared with the other
                 // four -- see `gui::util::deliver_world`. It was the only one
@@ -397,6 +500,110 @@ impl HeightmapApp {
                     }
                 });
             });
+
+            if !img_only {
+                t.row_hover(ui, "Entities", Some("Scatter a prefab over the terrain from a third image"), |ui| {
+                    ui.vertical(|ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            if widgets::info(ui, format!("{}  Entity map", icons::IMAGE)).clicked()
+                                && self.pending_pick.is_none()
+                            {
+                                self.pending_pick =
+                                    Some((PickTarget::EntityMap, pick_images(false)));
+                            }
+                            if widgets::info(ui, format!("{}  Prefab (.brz)", icons::IMAGE)).clicked()
+                                && self.pending_prefab.is_none()
+                            {
+                                self.pending_prefab = Some(pick_prefab_bytes());
+                            }
+                            if (self.entity_map.is_some() || self.entity_prefab.is_some())
+                                && widgets::danger_icon(ui, icons::XMARK).clicked()
+                            {
+                                self.entity_map = None;
+                                self.entity_prefab = None;
+                            }
+                        });
+                        let map = self.entity_map.as_ref().map(|i| i.name.as_str());
+                        let prefab = self.entity_prefab.as_ref().map(|(n, _)| n.as_str());
+                        match (map, prefab) {
+                            (None, None) => {
+                                ui.label(
+                                    "Each pixel of the entity map is one TILE. Black places \
+                                     nothing, white always places one entity somewhere in the \
+                                     tile, and a value between them is the probability. The \
+                                     size of the image gives the number of tiles.",
+                                );
+                            }
+                            (Some(map), Some(prefab)) => {
+                                let tiles = self
+                                    .entity_map
+                                    .as_ref()
+                                    .map(|i| (i.image.width(), i.image.height()))
+                                    .unwrap_or((0, 0));
+                                ui.label(format!(
+                                    "{map} ({}x{} tiles) scatters {prefab}",
+                                    tiles.0, tiles.1
+                                ));
+                            }
+                            // Each alone makes no save. Say which one is
+                            // missing rather than render nothing and stay
+                            // silent about the reason.
+                            (Some(map), None) => {
+                                ui.colored_label(
+                                    Color32::from_rgb(255, 100, 100),
+                                    format!("{map} needs a prefab: the image says WHERE an \
+                                             entity goes, and the .brz says WHAT goes there"),
+                                );
+                            }
+                            (None, Some(prefab)) => {
+                                ui.colored_label(
+                                    Color32::from_rgb(255, 200, 100),
+                                    format!("{prefab} needs an entity map, or nothing is \
+                                             scattered"),
+                                );
+                            }
+                        }
+                        if self.entity_map.is_some() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Density");
+                                widgets::slider(
+                                    ui,
+                                    egui::Slider::new(&mut self.entity_density, 0.0..=1.0),
+                                )
+                                .on_hover_text(
+                                    "Multiply the probability that each pixel gives. Use it to \
+                                     thin a forest without painting the map again",
+                                );
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Sink");
+                                widgets::slider(
+                                    ui,
+                                    egui::Slider::new(&mut self.entity_sink, 0..=40).text("units"),
+                                )
+                                .on_hover_text(
+                                    "How far each entity goes DOWN into the ground. This hides \
+                                     the bottom face of the prefab and stops a tree from \
+                                     standing on one point of a sloped cell",
+                                );
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Seed");
+                                widgets::slider(
+                                    ui,
+                                    egui::Slider::new(&mut self.entity_seed, 0..=999),
+                                )
+                                .on_hover_text("The same number always gives the same forest");
+                                widgets::toggle(ui, &mut self.entity_yaw, "Random turn")
+                                    .on_hover_text(
+                                        "Turn each entity by its own angle, so a forest of one \
+                                         prefab does not look like copies",
+                                    );
+                            });
+                        }
+                    });
+                });
+            }
 
             t.row_hover(ui, "Brick Type", Some("Change which brick type is used for the save file"), |ui| {
                 // `row_hover` gives the control a HORIZONTAL layout, so a note

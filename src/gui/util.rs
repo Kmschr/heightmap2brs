@@ -312,6 +312,29 @@ pub fn pick_animated_bytes() -> Promise<Option<(String, Vec<u8>)>> {
     }
 }
 
+/// Pick a prefab bundle's raw bytes and name, for the entity scatter.
+///
+/// Bytes and not a path, because the browser version has no file system and
+/// `opt::load_prefab` reads a `.brz` from memory for that reason. `None` if the
+/// user cancels.
+pub fn pick_prefab_bytes() -> Promise<Option<(String, Vec<u8>)>> {
+    let dialog = rfd::AsyncFileDialog::new().add_filter("Brickadia Prefabs", &["brz"]);
+    let pick = async move {
+        let handle = dialog.pick_file().await?;
+        let name = handle.file_name();
+        let bytes = handle.read().await;
+        Some((name, bytes))
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Promise::spawn_thread("pick_prefab_bytes", move || pollster::block_on(pick))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        Promise::spawn_async(pick)
+    }
+}
+
 /// Pick a subtitle file's raw bytes and name -- bytes rather than a path so it
 /// works on the web too; the name comes along since its extension picks the
 /// parser (`subs::parse_auto`). `None` if the user cancels.

@@ -26,6 +26,7 @@ USAGE:
 
 FLAGS:
         --cull         Automatically remove bottom level bricks and fully transparent bricks
+        --entities <img>  Scatter --entity-prefab over the terrain from a third image
         --glow         Make the heightmap glow at 0 intensity
         --greedy       Use greedy optimization
     -h, --help         Prints help information
@@ -93,6 +94,35 @@ pieces, and flat ground merges into large blocks. Under `--rampify`,
 `--vertical` is rounded to a whole number of plates (4 units).
 
 `heightmap heightmap.png -c colormap.png --rampify -v 8 -o rampified.brz`
+
+### Scattering entities
+
+`--entities` takes a **third image** and scatters a prefab over the terrain.
+Each of its pixels is one *tile* of the map: black or fully transparent places
+nothing, white always places one entity somewhere in that tile, and a value
+between the two is the probability. The position inside the tile is random, so
+a large white area does not come out as a grid.
+
+The image has its own size, and that size chooses how big a tile is — a 96x96
+entity map over a 384x384 heightmap gives one tile per 4x4 terrain cells. That
+is how you ask for one tree per N cells.
+
+`--entity-prefab` is the `.brz` to place. Save one in the game, then:
+
+`heightmap forest_hm.png -c forest_cm.png --terrain --size 8 -v 12 --entities forest_em.png --entity-prefab pine.brz -o forest.brz`
+
+**Each entity becomes its own brick grid.** Two bricks on one grid cannot
+occupy the same space, so a tree on the main grid would have to sit exactly on
+the surface and would appear to float over a sloped cell. A separate grid can
+be at any position and can pass through the main grid, so `--entity-sink`
+(default 4 units) simply pushes each prefab that far into the ground.
+
+The rest: `--entity-density` multiplies every pixel's probability (thin a
+forest without repainting the map), `--entity-seed` picks the layout (the same
+number always gives the same forest), and `--entity-no-yaw` turns off the
+random rotation that stops a forest of one prefab looking like copies.
+
+The GUI has the same controls in an **Entities** row.
 
 Add `--prefab` to either (or to any heightmap/`--img` render) to write a prefab
 bundle instead of a world, so the save can be dropped into Brickadia's `Prefabs`

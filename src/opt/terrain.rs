@@ -289,6 +289,58 @@ pub fn fit_cell(corners: Corners) -> CellFit {
     best
 }
 
+/// The height of each vertex of the shared `(w+1) x (h+1)` grid, with the
+/// stride of one row.
+///
+/// Vertex `(i, j)` is the mean of the four pixels that touch it, or of fewer
+/// pixels at an edge. Two adjacent cells then read the same vertex, which is
+/// what makes their surfaces touch.
+///
+/// This is a separate function because the terrain renderer and the entity
+/// placer must agree about the surface. If each had its own copy, an entity
+/// could sink into the ground or float above it.
+pub fn sample_shared_vertices(heightmap: &dyn Heightmap) -> (Vec<i32>, usize) {
+    let (width, height) = heightmap.size();
+    let stride = width as usize + 1;
+    let mut vertices = vec![0i32; stride * (height as usize + 1)];
+    for j in 0..=height {
+        for i in 0..=width {
+            let mut sum = 0i64;
+            let mut count = 0i64;
+            for (dx, dy) in [(-1i32, -1i32), (0, -1), (-1, 0), (0, 0)] {
+                let px = i as i32 + dx;
+                let py = j as i32 + dy;
+                if px >= 0 && py >= 0 && (px as u32) < width && (py as u32) < height {
+                    sum += heightmap.at(px as u32, py as u32).min(i32::MAX as u32) as i64;
+                    count += 1;
+                }
+            }
+            vertices[j as usize * stride + i as usize] = ((sum + count / 2) / count) as i32;
+        }
+    }
+    (vertices, stride)
+}
+
+/// The four corners of cell `(x, y)`, in the `(SW, SE, NE, NW)` sequence.
+pub fn corners_at(vertices: &[i32], stride: usize, x: u32, y: u32) -> Corners {
+    let (x, y) = (x as usize, y as usize);
+    [
+        vertices[y * stride + x],
+        vertices[y * stride + x + 1],
+        vertices[(y + 1) * stride + x + 1],
+        vertices[(y + 1) * stride + x],
+    ]
+}
+
+/// The number of units in one terrain layer, for a `--vertical` value.
+///
+/// The result is even and is 2 or more, because the half height in a
+/// `BrickSize` must be a whole unit and must not be zero.
+pub fn rise_unit(scale: u32) -> i32 {
+    let scale = scale.max(1) as i32;
+    scale + (scale & 1)
+}
+
 /// Make smooth micro wedge terrain from a heightmap.
 ///
 /// The code reads the heights from a shared grid of `(w+1) x (h+1)` vertices.
@@ -331,11 +383,8 @@ pub fn gen_terrain_heightmap<F: Fn(f32) -> bool>(
         return Err("Brick size must be at least 1".to_string());
     }
 
-    // Increased to an even number, with a minimum of 2. A rise of `rise_unit`
-    // units becomes a `BrickSize` half height of `rise_unit / 2`. That value
-    // must be a whole unit and must not be zero.
     let scale = options.scale.max(1) as i32;
-    let rise_unit = scale + (scale & 1);
+    let rise_unit = rise_unit(options.scale);
     if rise_unit != scale {
         info!(
             "Terrain layers are {rise_unit} units tall (--vertical {scale} rounded up: a micro \
@@ -345,34 +394,10 @@ pub fn gen_terrain_heightmap<F: Fn(f32) -> bool>(
     let half = options.size as i32;
 
     info!("Sampling shared vertex grid");
-    let stride = width as usize + 1;
-    let mut vertices = vec![0i32; stride * (height as usize + 1)];
-    for j in 0..=height {
-        for i in 0..=width {
-            let mut sum = 0i64;
-            let mut count = 0i64;
-            for (dx, dy) in [(-1i32, -1i32), (0, -1), (-1, 0), (0, 0)] {
-                let px = i as i32 + dx;
-                let py = j as i32 + dy;
-                if px >= 0 && py >= 0 && (px as u32) < width && (py as u32) < height {
-                    sum += heightmap.at(px as u32, py as u32).min(i32::MAX as u32) as i64;
-                    count += 1;
-                }
-            }
-            vertices[j as usize * stride + i as usize] = ((sum + count / 2) / count) as i32;
-        }
-    }
+    let (vertices, stride) = sample_shared_vertices(heightmap);
     progress!(0.2);
 
-    let corners_at = |x: u32, y: u32| -> Corners {
-        let (x, y) = (x as usize, y as usize);
-        [
-            vertices[y * stride + x],
-            vertices[y * stride + x + 1],
-            vertices[(y + 1) * stride + x + 1],
-            vertices[(y + 1) * stride + x],
-        ]
-    };
+    let corners_at = |x: u32, y: u32| -> Corners { corners_at(&vertices, stride, x, y) };
 
     // This pass keeps the floor of each cell only, because the foundation
     // depths below need no more. To keep the selected shapes would use five
