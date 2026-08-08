@@ -1565,7 +1565,7 @@ fn run_heightmap(
     // from the command line, so a prefab that cannot be read must not first
     // cost a render of five seconds. `gen_opt_heightmap` also takes `options`
     // by value, and the placer reads the same values to find the surface.
-    let entity_grids = match entity_grids(matches, &*heightmap, &options) {
+    let (entity_grids, entity_prefab) = match entity_grids(matches, &*heightmap, &options) {
         Ok(g) => g,
         Err(e) => fail!("{e}"),
     };
@@ -1593,6 +1593,11 @@ fn run_heightmap(
     // grids, so a render with no entities keeps the tables that each earlier
     // version of this path wrote.
     if has_entities {
+        // The assets FIRST: a component points at one by index, so the save
+        // has to list them in the order the prefab listed them.
+        if let Err(e) = register_prefab_assets(&mut data, &entity_prefab) {
+            fail!("{e}");
+        }
         data.register_used_components();
     }
     // A prefab bundle and a world bundle differ in their metadata only. The
@@ -1621,7 +1626,7 @@ fn entity_grids(
     matches: &clap::ArgMatches,
     heightmap: &dyn Heightmap,
     options: &GenOptions,
-) -> Result<Vec<(brdb::Entity, Vec<brdb::Brick>)>, String> {
+) -> Result<(Vec<(brdb::Entity, Vec<brdb::Brick>)>, Prefab), String> {
     let (Some(map_path), prefab_path) = (
         matches.value_of("entities"),
         matches.value_of("entityprefab"),
@@ -1639,7 +1644,7 @@ fn entity_grids(
                 warn!("{flag} applies to --entities renders only; there is no entity map to read");
             }
         }
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Prefab::default()));
     };
     let Some(prefab_path) = prefab_path else {
         return Err(
@@ -1671,7 +1676,8 @@ fn entity_grids(
 
     let map = ColormapPNG::new(map_path, true)
         .map_err(|e| format!("Error reading the entity map: {e}"))?;
-    place_entities(heightmap, &map, options, &entities)
+    let grids = place_entities(heightmap, &map, options, &entities)?;
+    Ok((grids, entities.prefab))
 }
 
 /// Print the pre-render cost readout for whichever mode was chosen. The

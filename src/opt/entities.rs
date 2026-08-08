@@ -28,8 +28,13 @@ use crate::map::*;
 use crate::opt::{corners_at, rise_unit, sample_shared_vertices};
 use crate::util::*;
 use brdb::{
-    Brick, BrickType, Brz, Entity, IntoReader, Position, Quat4f, Vector3f,
+    AsBrdbValue, BString, BrdbComponent, BrdbSchemaError, Brick, BrickType, Brz, Entity,
+    IntoReader, Position, Quat4f, Vector3f, World,
     assets::entities::{DYNAMIC_GRID, dynamic_grid_entity},
+    schema::{
+        BrdbInterned, BrdbSchema, BrdbStruct, BrdbValue,
+        as_brdb::{AsBrdbIter, BrdbArrayIter},
+    },
 };
 use log::{info, warn};
 
@@ -45,9 +50,8 @@ pub const MAX_ENTITIES: usize = 50_000;
 /// What to place, where, and how deep.
 #[derive(Clone)]
 pub struct EntityOptions {
-    /// The bricks of the prefab, with the center of their area at the origin
-    /// and their lowest face at Z zero. Use [`load_prefab`] to make them.
-    pub prefab: Vec<Brick>,
+    /// What to place, from [`load_prefab`].
+    pub prefab: Prefab,
     /// A number that multiplies the probability from each pixel. 1.0 keeps the
     /// value of the pixel, 0.5 gives half as many entities, and 0.0 gives
     /// none.
@@ -68,7 +72,7 @@ pub struct EntityOptions {
 impl Default for EntityOptions {
     fn default() -> Self {
         Self {
-            prefab: Vec::new(),
+            prefab: Prefab::default(),
             density: 1.0,
             sink: 4,
             // Off by default: a turn of any size needs one grid for each copy,
@@ -77,6 +81,156 @@ impl Default for EntityOptions {
             seed: 0,
         }
     }
+}
+
+/// One component read out of a prefab, with the type that it had there.
+///
+/// A component is NOT in the brick chunk: the game keeps it in a chunk of its
+/// own, and `iter_bricks` gives back an empty component list for every brick.
+/// A prefab that draws itself with decals, such as a tree made of
+/// `Component_TextDisplay` glyphs, therefore arrives as bare bricks unless the
+/// component chunks are read as well.
+///
+/// The data stays as the `BrdbStruct` that came off the disk. To take it apart
+/// and put it together again would mean one line of code for each property of
+/// each type of component, and each of those lines could be wrong. This holds
+/// the struct and gives back the name of its type, which is the one thing the
+/// brick chunk does not carry.
+#[derive(Clone)]
+struct PrefabComponent {
+    type_name: BString,
+    /// Behind an `Arc` because a scatter makes THOUSANDS of copies of the
+    /// prefab, and each copy clones every component of every brick. A
+    /// `BrdbStruct` holds a map of its properties, so a deep copy for each one
+    /// costs a great deal of memory: a tree of 340 bricks with a decal on each
+    /// of them, placed 2771 times, made 942 thousand of those maps and used
+    /// all the memory of the machine. The data never changes after it is read,
+    /// so one copy serves them all.
+    data: std::sync::Arc<BrdbStruct>,
+}
+
+impl PrefabComponent {
+    /// The value of a property, found by NAME.
+    ///
+    /// A `BrdbInterned` is a position in the string table of ONE schema. The
+    /// schema that WRITES a save is not the schema that the prefab was read
+    /// with, so their tables number the same names differently. To pass an
+    /// interned name straight through gives the wrong property, or none: a
+    /// field that the writer expects to hold a string then holds a struct, and
+    /// the save is refused. The name is therefore resolved against the schema
+    /// that asks, and looked up by that name.
+    fn property(&self, schema: &BrdbSchema, prop_name: BrdbInterned) -> Option<&BrdbValue> {
+        self.data.get(prop_name.get(schema)?)
+    }
+
+    fn missing(&self, schema: &BrdbSchema, prop_name: BrdbInterned) -> BrdbSchemaError {
+        BrdbSchemaError::MissingStructField(
+            self.type_name.to_string(),
+            prop_name
+                .get(schema)
+                .unwrap_or("unknown property")
+                .to_string(),
+        )
+    }
+}
+
+impl AsBrdbValue for PrefabComponent {
+    fn has_brdb_struct_prop(
+        &self,
+        schema: &BrdbSchema,
+        _struct_name: BrdbInterned,
+        prop_name: BrdbInterned,
+    ) -> bool {
+        self.property(schema, prop_name).is_some()
+    }
+
+    fn as_brdb_struct_prop_value(
+        &self,
+        schema: &BrdbSchema,
+        _struct_name: BrdbInterned,
+        prop_name: BrdbInterned,
+    ) -> Result<&dyn AsBrdbValue, BrdbSchemaError> {
+        self.property(schema, prop_name)
+            .map(|value| value as &dyn AsBrdbValue)
+            .ok_or_else(|| self.missing(schema, prop_name))
+    }
+
+    fn as_brdb_struct_prop_array(
+        &self,
+        schema: &BrdbSchema,
+        _struct_name: BrdbInterned,
+        prop_name: BrdbInterned,
+    ) -> Result<BrdbArrayIter<'_>, BrdbSchemaError> {
+        match self.property(schema, prop_name) {
+            Some(BrdbValue::Array(values)) | Some(BrdbValue::FlatArray(values)) => {
+                Ok(values.as_brdb_iter())
+            }
+            _ => Err(self.missing(schema, prop_name)),
+        }
+    }
+}
+
+impl BrdbComponent for PrefabComponent {
+    fn component_type(&self) -> Option<BString> {
+        Some(self.type_name.clone())
+    }
+}
+
+/// The contents of a prefab: its bricks, and the assets that its components
+/// point at.
+#[derive(Clone, Default)]
+pub struct Prefab {
+    /// The bricks, with the middle of their area at the origin and their
+    /// lowest face at Z zero. Each one carries the components it had.
+    pub bricks: Vec<Brick>,
+    /// The external assets, as `(type, name)`, in the ORDER that gives each
+    /// one its index. A component holds an index into this list and not a
+    /// name: the font of a `Component_TextDisplay` is `Asset(Some(0))`. The
+    /// save that receives these bricks must therefore list the same assets in
+    /// the same order. [`register_prefab_assets`] does that.
+    pub external_assets: Vec<(String, String)>,
+}
+
+impl Prefab {
+    pub fn len(&self) -> usize {
+        self.bricks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bricks.is_empty()
+    }
+}
+
+/// Put the assets of a prefab into a world, keeping the index of each one.
+///
+/// A component points at an asset by INDEX, so the world must list the assets
+/// in the order that the prefab listed them. This refuses a world that already
+/// holds a reference of its own, because the indexes would then move and a
+/// decal would take the wrong font.
+pub fn register_prefab_assets(world: &mut World, prefab: &Prefab) -> Result<(), String> {
+    if prefab.external_assets.is_empty() {
+        return Ok(());
+    }
+    if !world.global_data.external_asset_references.is_empty() {
+        return Err(format!(
+            "the save already points at {} external asset(s), so the {} asset(s) of the prefab \
+             cannot keep their index. A component holds an index and not a name, so its decals \
+             would take the wrong asset",
+            world.global_data.external_asset_references.len(),
+            prefab.external_assets.len(),
+        ));
+    }
+    for (asset_type, name) in &prefab.external_assets {
+        world
+            .global_data
+            .external_asset_types
+            .insert(asset_type.clone());
+        world
+            .global_data
+            .external_asset_references
+            .insert((asset_type.clone(), name.clone()));
+    }
+    Ok(())
 }
 
 /// Read the bricks of a prefab from the bytes of a `.brz` file.
@@ -89,7 +243,7 @@ impl Default for EntityOptions {
 ///
 /// This takes bytes and not a path, because the browser version of the GUI has
 /// no file system and gets the bytes from a dialog.
-pub fn load_prefab(bytes: &[u8]) -> Result<Vec<Brick>, String> {
+pub fn load_prefab(bytes: &[u8]) -> Result<Prefab, String> {
     let brz = Brz::read(&mut std::io::Cursor::new(bytes))
         .map_err(|e| format!("could not read the prefab: {e}"))?;
     let reader = brz.into_reader();
@@ -98,6 +252,7 @@ pub fn load_prefab(bytes: &[u8]) -> Result<Vec<Brick>, String> {
         .map_err(|e| format!("could not read the prefab: {e}"))?;
 
     let mut bricks = Vec::new();
+    let mut components = 0usize;
     // Grid 0 does not exist in a prefab bundle, and a grid past the last one
     // gives an error rather than an empty list, so a missing grid ends the
     // loop instead of stopping the read.
@@ -109,9 +264,13 @@ pub fn load_prefab(bytes: &[u8]) -> Result<Vec<Brick>, String> {
             let soa = reader
                 .brick_chunk_soa(grid, meta.index)
                 .map_err(|e| format!("could not read the prefab: {e}"))?;
+            // Where this chunk's bricks start in the list, so a component can
+            // find the brick that it belongs to.
+            let first = bricks.len();
             for brick in soa.iter_bricks(meta.index, global.clone()) {
                 bricks.push(brick.map_err(|e| format!("could not read the prefab: {e}"))?);
             }
+            components += attach_components(&reader, &global, grid, meta.index, first, &mut bricks)?;
         }
     }
     if bricks.is_empty() {
@@ -149,14 +308,92 @@ pub fn load_prefab(bytes: &[u8]) -> Result<Vec<Brick>, String> {
         // thousands of times in one save.
         brick.id = None;
     }
+    // In the order that gives each asset its index, which is what a component
+    // stores.
+    let external_assets: Vec<(String, String)> = global
+        .external_asset_references
+        .iter()
+        .cloned()
+        .collect();
+
     info!(
-        "Prefab: {} brick(s), {}x{}x{} units",
+        "Prefab: {} brick(s), {}x{}x{} units, {components} component(s), {} external asset(s)",
         bricks.len(),
         hi[0] - lo[0],
         hi[1] - lo[1],
         hi[2] - lo[2],
+        external_assets.len(),
     );
-    Ok(bricks)
+    Ok(Prefab {
+        bricks,
+        external_assets,
+    })
+}
+
+/// Put the components of one chunk back onto their bricks, and say how many
+/// there were.
+///
+/// The game keeps components in a chunk beside the brick chunk. That chunk
+/// holds, for each component, the index of its brick INSIDE this chunk, so
+/// `first` moves those indexes into the full list. The types come from a list
+/// of counters: the first counter covers the first `num_instances` components,
+/// the next covers the ones after them, and so on.
+fn attach_components<T: brdb::BrFsReader>(
+    reader: &brdb::BrReader<T>,
+    global: &brdb::schema::BrdbSchemaGlobalData,
+    grid: usize,
+    chunk: brdb::ChunkIndex,
+    first: usize,
+    bricks: &mut [Brick],
+) -> Result<usize, String> {
+    // A chunk with no components has no file, which is not a fault.
+    let Ok((soa, data)) = reader.component_chunk_soa(grid, chunk) else {
+        return Ok(0);
+    };
+
+    // The type of each component, in the order that the data arrives.
+    let mut types = Vec::with_capacity(data.len());
+    for counter in &soa.component_type_counters {
+        let name = global
+            .component_type_names
+            .get_index(counter.type_index as usize)
+            .ok_or_else(|| {
+                format!(
+                    "the prefab names a component type {} that it does not list",
+                    counter.type_index
+                )
+            })?;
+        for _ in 0..counter.num_instances {
+            types.push(BString::from(name.clone()));
+        }
+    }
+    if types.len() != data.len() {
+        return Err(format!(
+            "the prefab counts {} component(s) but carries {} of them",
+            types.len(),
+            data.len()
+        ));
+    }
+
+    let mut attached = 0;
+    for (index, (type_name, struct_data)) in soa
+        .component_brick_indices
+        .iter()
+        .zip(types.into_iter().zip(data))
+    {
+        let brick = first + *index as usize;
+        let Some(brick) = bricks.get_mut(brick) else {
+            return Err(format!(
+                "the prefab puts a component on brick {brick}, which it does not have"
+            ));
+        };
+        brick.components.push(Box::new(PrefabComponent {
+            type_name,
+            data: std::sync::Arc::new(struct_data),
+        }));
+        attached += 1;
+    }
+    Ok(attached)
 }
 
 /// A small random sequence with a fixed result for a given seed and position.
@@ -341,7 +578,7 @@ pub fn place_entities(
             .map(|(i, at)| {
                 (
                     grid_entity(*at, unit(entities.seed, i as u32, 0, 3) * std::f32::consts::TAU),
-                    entities.prefab.clone(),
+                    entities.prefab.bricks.clone(),
                 )
             })
             .collect()
@@ -365,7 +602,7 @@ pub fn place_entities(
                 at.y.round() as i32,
                 at.z.round() as i32,
             );
-            bricks.extend(entities.prefab.iter().map(|brick| {
+            bricks.extend(entities.prefab.bricks.iter().map(|brick| {
                 let mut brick = brick.clone();
                 brick.position += offset;
                 brick
@@ -490,8 +727,11 @@ mod tests {
         }
     }
 
-    fn one_brick() -> Vec<Brick> {
-        vec![Brick::default()]
+    fn one_brick() -> Prefab {
+        Prefab {
+            bricks: vec![Brick::default()],
+            external_assets: Vec::new(),
+        }
     }
 
     /// The number of copies, whatever shape the result took: one grid holding
@@ -547,15 +787,86 @@ mod tests {
         ]);
         let bytes = world.to_brz_vec().expect("the fixture must encode");
 
-        let bricks = load_prefab(&bytes).expect("the fixture must read back");
-        assert_eq!(bricks.len(), 2);
-        for brick in &bricks {
+        let prefab = load_prefab(&bytes).expect("the fixture must read back");
+        assert_eq!(prefab.len(), 2);
+        for brick in &prefab.bricks {
             assert_eq!(
                 (brick.owner_index, brick.original_owner_index, brick.id),
                 (None, None, None),
                 "a brick of a prefab must point at no owner and no id of its own save"
             );
         }
+    }
+
+    /// A prefab that draws itself with decals must keep them.
+    ///
+    /// A component is NOT in the brick chunk: the game keeps it in a chunk of
+    /// its own, and `iter_bricks` gives back an empty component list. A tree
+    /// made of `Component_TextDisplay` glyphs therefore arrives as bare bricks
+    /// unless the component chunks are read too. The test goes through a real
+    /// `.brz`, because that is the part that was wrong.
+    #[test]
+    fn a_prefab_keeps_the_components_of_its_bricks() {
+        use brdb::{AsBrdbValue, assets::LiteralComponent, schema::BrdbValue};
+
+        let mut world = brdb::World::new();
+        let font = world
+            .global_data
+            .external_asset_references
+            .insert_full(("BrickFontDescriptor".to_string(), "MonaspaceArgon".to_string()))
+            .0;
+        world
+            .global_data
+            .external_asset_types
+            .insert("BrickFontDescriptor".to_string());
+        world.add_bricks(vec![
+            Brick {
+                position: Position::new(0, 0, 4),
+                ..Default::default()
+            }
+            .with_component(LiteralComponent::new("Component_TextDisplay").with_data([
+                ("Text", Box::new("leaf".to_string()) as Box<dyn AsBrdbValue>),
+                ("Font", Box::new(BrdbValue::Asset(Some(font)))),
+            ])),
+            Brick {
+                position: Position::new(0, 0, 12),
+                ..Default::default()
+            },
+        ]);
+        world.register_used_components();
+        let bytes = world.to_brz_vec().expect("the fixture must encode");
+
+        let prefab = load_prefab(&bytes).expect("the fixture must read back");
+        assert_eq!(prefab.len(), 2);
+        let decals: usize = prefab.bricks.iter().map(|b| b.components.len()).sum();
+        assert_eq!(decals, 1, "the decal of the prefab must come back with it");
+        assert_eq!(
+            prefab.bricks.iter().position(|b| !b.components.is_empty()),
+            Some(0),
+            "the decal must go back on the brick that had it"
+        );
+        assert_eq!(
+            prefab.external_assets,
+            vec![("BrickFontDescriptor".to_string(), "MonaspaceArgon".to_string())],
+            "the font that the decal points at must come with it"
+        );
+
+        // ...and the whole thing must survive a second trip, which is what a
+        // render does: read a prefab, put its bricks in a save, write it.
+        let mut out = brdb::World::new();
+        register_prefab_assets(&mut out, &prefab).unwrap();
+        out.add_bricks(prefab.bricks.clone());
+        out.register_used_components();
+        assert!(
+            out.global_data.has_component_type("Component_TextDisplay"),
+            "the save must name the type of the component, or the game drops it"
+        );
+        let again = load_prefab(&out.to_brz_vec().unwrap()).unwrap();
+        assert_eq!(
+            again.bricks.iter().map(|b| b.components.len()).sum::<usize>(),
+            1,
+            "the decal must survive being written into a save and read again"
+        );
     }
 
     /// The bricks must move to the origin, or each entity would go to the
@@ -575,7 +886,7 @@ mod tests {
             },
         ]);
         let bytes = world.to_brz_vec().unwrap();
-        let bricks = load_prefab(&bytes).unwrap();
+        let bricks = load_prefab(&bytes).unwrap().bricks;
 
         // The two bricks are the same size, so the middle of the pair goes to
         // x 0 and y 0 and the lower one stands at z 0.

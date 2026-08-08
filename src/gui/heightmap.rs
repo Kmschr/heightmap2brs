@@ -354,8 +354,10 @@ impl HeightmapApp {
                 // find the surface. A prefab that cannot be read then fails at
                 // once and does not first cost a full render.
                 let mut grids = Vec::new();
+                let mut prefab = Prefab::default();
                 if let Some(entities) = entities {
                     let entities = entities?;
+                    prefab = entities.prefab.clone();
                     let map = ColormapPNG::from_image(
                         // `lrgb` true keeps the values of the pixels: the
                         // entity map is a mask and not a color, so it must not
@@ -386,6 +388,9 @@ impl HeightmapApp {
                 // Without this the encoder refuses the save with
                 // "Entity_DynamicBrickGrid: unknown type".
                 if has_entities {
+                    // The assets FIRST: a component points at one by index, so
+                    // the save has to list them in the order the prefab did.
+                    register_prefab_assets(&mut data, &prefab)?;
                     data.register_used_components();
                 }
 
